@@ -77,10 +77,12 @@ async def send_telegram(message: str):
 # ═══════════════════════════════════════════════════════════════
 #  PAIR SCANNER
 # ═══════════════════════════════════════════════════════════════
-async def fetch_klines(session, symbol, interval='1h', limit=1500):
-    url = f"{FAPI_URL}/fapi/v1/klines"
-    params = {"symbol": symbol, "interval": interval, "limit": limit}
+async def fetch_klines(session, symbol, interval='1h', limit=1500, sem=None):
+    if sem:
+        await sem.acquire()
     try:
+        url = f"{FAPI_URL}/fapi/v1/klines"
+        params = {"symbol": symbol, "interval": interval, "limit": limit}
         async with session.get(url, params=params, timeout=15) as response:
             if response.status != 200:
                 logger.error(f"API Error {response.status} for {symbol}: {await response.text()}")
@@ -98,6 +100,9 @@ async def fetch_klines(session, symbol, interval='1h', limit=1500):
                 return df[['close']]
     except Exception as e:
         logger.error(f"Failed to fetch {symbol}: {e}")
+    finally:
+        if sem:
+            sem.release()
     return None
 
 def test_pair(df1, df2, sym1, sym2):
@@ -142,23 +147,36 @@ async def scan_all_pairs():
 
     logger.info(f"📡 Scanner: Downloading {len(all_symbols)} symbols...")
     price_data = {}
+    
+    # 💥 CHANGE: Limit concurrency to avoid being dropped by Binance
+    sem = asyncio.Semaphore(5)
+    
     async with aiohttp.ClientSession() as session:
-        tasks_dict = {sym: fetch_klines(session, sym) for sym in all_symbols}
+        tasks_dict = {sym: fetch_klines(session, sym, sem=sem) for sym in all_symbols}
         results = await asyncio.gather(*tasks_dict.values())
         for sym, result in zip(tasks_dict.keys(), results):
             if result is not None:
                 price_data[sym] = result
 
+    logger.info(f"📡 Scanner: Download complete. Successfully fetched {len(price_data)}/{len(all_symbols)} symbols.")
+    logger.info(f"📡 Scanner: Running cointegration math on free-tier CPU... (this may take up to 60s)")
+
     winners = []
+    pairs_tested = 0
     for sector_syms in SECTORS.values():
         available = [s for s in sector_syms if s in price_data]
         for s1, s2 in combinations(available, 2):
             result = test_pair(price_data[s1], price_data[s2], s1, s2)
             if result:
                 winners.append(result)
+            pairs_tested += 1
+            
+            # 🔥 CHANGE: Give async loop a breather to avoid UptimeRobot failing
+            if pairs_tested % 50 == 0:
+                await asyncio.sleep(0.01)
 
     winners.sort(key=lambda x: x["abs_z"], reverse=True)
-    logger.info(f"📡 Scanner: Found {len(winners)} cointegrated pairs.")
+    logger.info(f"📡 Scanner: Math complete! Found {len(winners)} cointegrated pairs out of {pairs_tested} tested.")
     return winners
 
 # ═══════════════════════════════════════════════════════════════
