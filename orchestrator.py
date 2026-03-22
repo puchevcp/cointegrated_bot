@@ -81,7 +81,10 @@ async def fetch_klines(session, symbol, interval='1h', limit=1500):
     url = f"{FAPI_URL}/fapi/v1/klines"
     params = {"symbol": symbol, "interval": interval, "limit": limit}
     try:
-        async with session.get(url, params=params) as response:
+        async with session.get(url, params=params, timeout=15) as response:
+            if response.status != 200:
+                logger.error(f"API Error {response.status} for {symbol}: {await response.text()}")
+                return None
             data = await response.json()
             if isinstance(data, list) and len(data) > 0:
                 df = pd.DataFrame(data, columns=[
@@ -93,8 +96,8 @@ async def fetch_klines(session, symbol, interval='1h', limit=1500):
                 df['close'] = df['close'].astype(float)
                 df.set_index('timestamp', inplace=True)
                 return df[['close']]
-    except Exception:
-        pass
+    except Exception as e:
+        logger.error(f"Failed to fetch {symbol}: {e}")
     return None
 
 def test_pair(df1, df2, sym1, sym2):
@@ -523,25 +526,34 @@ class Orchestrator:
 
     async def scan_and_launch(self):
         """Scan for pairs and auto-launch monitors for hot opportunities."""
-        winners = await scan_all_pairs()
-        hot_pairs = [w for w in winners if w["abs_z"] >= 2.0]
+        try:
+            winners = await scan_all_pairs()
+            hot_pairs = [w for w in winners if w["abs_z"] >= 2.0]
+            
+            msg = f"📡 <b>Scanner Update</b>\nFound {len(winners)} cointegrated pairs."
+            if hot_pairs:
+                names = ", ".join([w["display"] for w in hot_pairs[:5]])
+                msg += f"\n🔥 Found {len(hot_pairs)} hot pairs (|Z| ≥ 2.0):\n{names}"
+            else:
+                msg += f"\n🧊 No pairs found with |Z| ≥ 2.0 right now."
+                
+            await send_telegram(msg)
 
-        if hot_pairs:
-            names = ", ".join([w["display"] for w in hot_pairs[:5]])
-            await send_telegram(f"📡 <b>Scanner Update</b>\nFound {len(hot_pairs)} hot pairs (|Z| ≥ 2.0):\n{names}")
+            slots = MAX_PAIRS - self.active_count()
+            launched = 0
+            for pair in hot_pairs:
+                if slots <= 0:
+                    break
+                if pair["pair_key"] not in self.active_monitors:
+                    await self.launch_monitor(pair)
+                    slots -= 1
+                    launched += 1
 
-        slots = MAX_PAIRS - self.active_count()
-        launched = 0
-        for pair in hot_pairs:
-            if slots <= 0:
-                break
-            if pair["pair_key"] not in self.active_monitors:
-                await self.launch_monitor(pair)
-                slots -= 1
-                launched += 1
-
-        if launched > 0:
-            logger.info(f"🚀 Launched {launched} new monitors. Active: {self.active_count()}/{MAX_PAIRS}")
+            if launched > 0:
+                logger.info(f"🚀 Launched {launched} new monitors. Active: {self.active_count()}/{MAX_PAIRS}")
+        except Exception as e:
+            logger.error(f"Error in scan_and_launch: {e}")
+            await send_telegram(f"⚠️ <b>Scanner Error</b>\n{e}")
 
     async def run(self):
         logger.info("=" * 60)
@@ -566,10 +578,7 @@ class Orchestrator:
         # Periodic scanning loop
         while True:
             await asyncio.sleep(SCAN_INTERVAL_MINUTES * 60)
-            try:
-                await self.scan_and_launch()
-            except Exception as e:
-                logger.error(f"Scanner error: {e}")
+            await self.scan_and_launch()
 
     async def _daily_summary_loop(self):
         """Send a daily summary report to Telegram every 24 hours."""
