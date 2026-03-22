@@ -171,9 +171,13 @@ async def scan_all_pairs():
                 winners.append(result)
             pairs_tested += 1
             
-            # 🔥 CHANGE: Give async loop a breather to avoid UptimeRobot failing
+            # 🔥 CHANGE: Yield event loop every single pair so the Render HTTP server 
+            # can answer health checks instantly and not get killed for being unresponsive.
             if pairs_tested % 50 == 0:
+                logger.info(f"📡 Scanner progress: {pairs_tested} pairs analyzed...")
                 await asyncio.sleep(0.01)
+            else:
+                await asyncio.sleep(0)
 
     winners.sort(key=lambda x: x["abs_z"], reverse=True)
     logger.info(f"📡 Scanner: Math complete! Found {len(winners)} cointegrated pairs out of {pairs_tested} tested.")
