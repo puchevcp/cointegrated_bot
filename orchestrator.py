@@ -166,18 +166,17 @@ async def scan_all_pairs():
     for sector_syms in SECTORS.values():
         available = [s for s in sector_syms if s in price_data]
         for s1, s2 in combinations(available, 2):
-            result = test_pair(price_data[s1], price_data[s2], s1, s2)
+            # 🔥 CRITICAL FIX: Run CPU-bound math in a background thread
+            # so the asyncio event loop (and HTTP health server) NEVER freezes.
+            result = await asyncio.to_thread(test_pair, price_data[s1], price_data[s2], s1, s2)
             if result:
                 winners.append(result)
             pairs_tested += 1
             
-            # 🔥 CHANGE: Yield event loop every single pair so the Render HTTP server 
-            # can answer health checks instantly and not get killed for being unresponsive.
             if pairs_tested % 50 == 0:
                 logger.info(f"📡 Scanner progress: {pairs_tested} pairs analyzed...")
+                # Tiny sleep just in case to let other tasks run explicitly
                 await asyncio.sleep(0.01)
-            else:
-                await asyncio.sleep(0)
 
     winners.sort(key=lambda x: x["abs_z"], reverse=True)
     logger.info(f"📡 Scanner: Math complete! Found {len(winners)} cointegrated pairs out of {pairs_tested} tested.")
