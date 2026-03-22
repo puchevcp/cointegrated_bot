@@ -173,7 +173,7 @@ async def scan_all_pairs():
                 winners.append(result)
             pairs_tested += 1
             
-            if pairs_tested % 50 == 0:
+            if pairs_tested % 10 == 0:
                 logger.info(f"📡 Scanner progress: {pairs_tested} pairs analyzed...")
                 # Tiny sleep just in case to let other tasks run explicitly
                 await asyncio.sleep(0.01)
