@@ -7,6 +7,7 @@ Environment Variables:
   CHAT_ID          - Your Telegram chat ID
   CAPITAL_PER_PAIR - USD allocated per pair (default: 1000)
   MAX_PAIRS        - Max simultaneous pairs to monitor (default: 3)
+  PORT             - HTTP port for health check (default: 10000, set by Render)
 """
 import asyncio
 import json
@@ -610,6 +611,49 @@ class Orchestrator:
 
         await send_telegram("\n".join(lines))
 
-if __name__ == "__main__":
+# ═══════════════════════════════════════════════════════════════
+#  HTTP HEALTH SERVER (keeps Render free tier alive via UptimeRobot)
+# ═══════════════════════════════════════════════════════════════
+async def health_handler(request):
+    """Returns bot status as JSON. UptimeRobot pings this every 5 min."""
+    orch = request.app.get("orchestrator")
+    status = {
+        "status": "running",
+        "active_pairs": orch.active_count() if orch else 0,
+        "max_pairs": MAX_PAIRS,
+        "capital_per_pair": CAPITAL_PER_PAIR,
+    }
+    if orch:
+        status["monitors"] = []
+        for key, monitor in orch.monitor_instances.items():
+            m = {
+                "pair": monitor.display,
+                "in_trade": monitor.position["tranches_filled"] > 0,
+                "entries": f"{monitor.position['tranches_filled']}/{len(ENTRY_TRANCHES)}",
+                "exits": f"{monitor.position['exits_done']}/{len(EXIT_TRANCHES)}",
+                "pnl": round(monitor.balance_contribution, 2),
+            }
+            status["monitors"].append(m)
+    from aiohttp import web
+    return web.json_response(status)
+
+async def start_http_server(orchestrator_instance):
+    from aiohttp import web
+    app = web.Application()
+    app["orchestrator"] = orchestrator_instance
+    app.router.add_get("/", health_handler)
+    app.router.add_get("/health", health_handler)
+    port = int(os.environ.get("PORT", "10000"))
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    logger.info(f"🌐 Health server running on port {port}")
+
+async def main():
     orchestrator = Orchestrator()
-    asyncio.run(orchestrator.run())
+    await start_http_server(orchestrator)
+    await orchestrator.run()
+
+if __name__ == "__main__":
+    asyncio.run(main())

@@ -1,1 +1,1 @@
-worker: python stat_arb/orchestrator.py
+web: python stat_arb/orchestrator.py
