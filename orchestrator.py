@@ -39,7 +39,8 @@ FUNDING_RATE = 0.0001  # 0.01% per 8 hours
 FUNDING_INTERVAL_HOURS = 8
 TIME_STOP_DAY_1 = 3   # Close 50% after 3 days
 TIME_STOP_DAY_2 = 5   # Close remaining after 5 days
-SCAN_INTERVAL_MINUTES = 10
+STALE_EXIT_HOURS = 24  # Force close if in profit after 24h to free up slot
+SCAN_INTERVAL_MINUTES = 5
 CSV_FILE = "stat_arb_log_v2.csv"
 FAPI_URL = "https://fapi.binance.com"
 
@@ -397,6 +398,41 @@ class PairMonitor:
             return "TIME_STOP_D3"
         return None
 
+    def _get_current_net_pnl(self):
+        """Calculate current net PnL including estimated fees and funding."""
+        if self.position["tranches_filled"] == 0:
+            return 0.0
+        p1, p2 = self.prices[self.sym1], self.prices[self.sym2]
+        avg_1 = self.position["spent_1"] / self.position["original_qty_1"]
+        avg_2 = self.position["spent_2"] / self.position["original_qty_2"]
+        rq1, rq2 = self.position["qty_1"], self.position["qty_2"]
+        remaining_pct = rq1 / self.position["original_qty_1"] if self.position["original_qty_1"] > 0 else 1.0
+
+        if self.position["side"] == "LONG_1_SHORT_2":
+            gross = (p1 - avg_1) * rq1 + (avg_2 - p2) * rq2
+        else:
+            gross = (avg_1 - p1) * rq1 + (p2 - avg_2) * rq2
+
+        volume = (rq1 * p1 + rq2 * p2) * 2
+        fees = volume * FEE_RATE
+        funding = self.position["total_funding_paid"] * remaining_pct
+        return gross - fees - funding
+
+    def _check_stale_exit(self):
+        """Check if position is stale (24h+) but in profit. Exit to free up slots."""
+        if self.position["tranches_filled"] == 0 or not self.position["entry_time"]:
+            return False
+        
+        entry = datetime.fromisoformat(self.position["entry_time"])
+        hours_open = (datetime.now() - entry).total_seconds() / 3600
+        
+        if hours_open >= STALE_EXIT_HOURS:
+            net_pnl = self._get_current_net_pnl()
+            if net_pnl > 0:
+                logger.warning(f"⏰ [{self.display}] STALE EXIT triggered: {hours_open:.1f}h open, Net PnL: ${net_pnl:.2f}")
+                return True
+        return False
+
     async def process_tick(self):
         self.ticks += 1
         if self.prices[self.sym1] == 0.0 or self.prices[self.sym2] == 0.0:
@@ -426,6 +462,12 @@ class PairMonitor:
         if self.position["tranches_filled"] > 0 and abs_z >= STOP_LOSS_Z:
             await self._execute_full_exit("STOP_LOSS")
             return
+
+        # STALE EXIT (24h + profit)
+        if self.position["tranches_filled"] > 0:
+            if self._check_stale_exit():
+                await self._execute_full_exit(reason="STALE_EXIT")
+                return
 
         # TIME STOP CHECK
         if self.position["tranches_filled"] > 0:
@@ -555,10 +597,10 @@ class Orchestrator:
             if hot_pairs:
                 names = ", ".join([w["display"] for w in hot_pairs[:5]])
                 msg += f"\n🔥 Found {len(hot_pairs)} hot pairs (|Z| ≥ 2.0):\n{names}"
+                await send_telegram(msg)
             else:
                 msg += f"\n🧊 No pairs found with |Z| ≥ 2.0 right now."
-                
-            await send_telegram(msg)
+                logger.info(f"📡 Scanner Result: {len(winners)} pairs found, 0 hot.")
 
             slots = MAX_PAIRS - self.active_count()
             launched = 0
