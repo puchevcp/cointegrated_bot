@@ -628,19 +628,22 @@ class Orchestrator:
         try:
             winners = await scan_all_pairs()
             hot_pairs = [w for w in winners if w["abs_z"] >= 2.0]
+            new_hot_pairs = [w for w in hot_pairs if w["pair_key"] not in self.active_monitors]
             
-            msg = f"📡 <b>Scanner Update</b>\nFound {len(winners)} cointegrated pairs."
-            if hot_pairs:
-                names = ", ".join([w["display"] for w in hot_pairs[:5]])
-                msg += f"\n🔥 Found {len(hot_pairs)} hot pairs (|Z| ≥ 2.0):\n{names}"
-                await send_telegram(msg)
-            else:
-                now = datetime.now()
-                if (now - self.last_scan_alert_time).total_seconds() >= 3600:
+            now = datetime.now()
+            # ONLY alert if we found NEW hot pairs OR if 1 hour has passed since the last alert
+            if new_hot_pairs or (now - self.last_scan_alert_time).total_seconds() >= 3600:
+                msg = f"📡 <b>Scanner Update</b>\nFound {len(winners)} cointegrated pairs."
+                if hot_pairs:
+                    names = ", ".join([w["display"] for w in hot_pairs[:5]])
+                    msg += f"\n🔥 Found {len(hot_pairs)} hot pairs (|Z| ≥ 2.0):\n{names}"
+                else:
                     msg += f"\n🧊 No pairs found with |Z| ≥ 2.0 right now."
-                    await send_telegram(msg)
-                    self.last_scan_alert_time = now
-                logger.info(f"📡 Scanner Result: {len(winners)} pairs found, 0 hot.")
+                
+                await send_telegram(msg)
+                self.last_scan_alert_time = now
+                
+            logger.info(f"📡 Scanner Result: {len(winners)} pairs found, {len(hot_pairs)} hot.")
 
             slots = MAX_PAIRS - self.active_count()
             launched = 0
