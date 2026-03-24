@@ -200,7 +200,8 @@ if not os.path.exists(CSV_FILE):
 class PairMonitor:
     """Manages a single pair's trading lifecycle."""
 
-    def __init__(self, pair_info: dict):
+    def __init__(self, pair_info: dict, orchestrator=None):
+        self.orchestrator = orchestrator
         self.sym1 = pair_info["sym1"]
         self.sym2 = pair_info["sym2"]
         self.pair_key = pair_info["pair_key"]
@@ -226,6 +227,17 @@ class PairMonitor:
             "total_funding_paid": 0.0,
         }
         self._load_state()
+
+    def _get_summary_footer(self):
+        if not self.orchestrator:
+            return ""
+        active = self.orchestrator.active_count()
+        total_pnl = sum([m.balance_contribution for m in self.orchestrator.monitor_instances.values()])
+        avail = (MAX_PAIRS - active) * CAPITAL_PER_PAIR
+        deployed = active * CAPITAL_PER_PAIR
+        return (f"\n\n📊 <b>Portfolio Update</b>\n"
+                f"Pairs: {active}/{MAX_PAIRS} | PnL: ${total_pnl:.2f}\n"
+                f"Capital: ${deployed:.0f} deployed / ${avail:.0f} idle")
 
     def _save_state(self):
         with open(self.state_file, "w") as f:
@@ -294,6 +306,7 @@ class PairMonitor:
                f"Side: {side} | Z: {z_score:.2f}\n"
                f"Capital: ${capital:.0f} | Total Invested: ${total_invested:.0f}\n"
                f"Avg {self.sym1}: {p1:.4f}")
+        msg += self._get_summary_footer()
         logger.warning(f"🏦 [{self.display}] ENTRY {idx+1}/{len(ENTRY_TRANCHES)} | {side} | Z: {z_score:.2f} | ${capital:.0f}")
         await send_telegram(msg)
         self._save_state()
@@ -315,7 +328,12 @@ class PairMonitor:
         volume = (close_q1 * p1 + close_q2 * p2) * 2
         fees = volume * FEE_RATE
         funding_portion = self.position["total_funding_paid"] * exit_pct
-        net = pnl - fees - funding_portion
+        
+        # Format explicitly before subtracting to fix rounding sync
+        pnl = round(pnl, 2)
+        fees = round(fees, 2)
+        funding_portion = round(funding_portion, 2)
+        net = round(pnl - fees - funding_portion, 2)
 
         self.position["exits_done"] += 1
         self.position["qty_1"] -= close_q1
@@ -327,6 +345,7 @@ class PairMonitor:
                f"Gross: ${pnl:.2f} | Fees: ${fees:.2f} | Funding: ${funding_portion:.2f}\n"
                f"<b>NET PnL: ${net:.2f}</b>\n"
                f"💼 Pair Balance: ${pair_balance:.2f}")
+        msg += self._get_summary_footer()
         logger.info(f"🟢 [{self.display}] EXIT {self.position['exits_done']}/{len(EXIT_TRANCHES)} | {reason} | NET: ${net:.2f}")
         await send_telegram(msg)
         await self._log_trade(p1, p2, pnl, fees, funding_portion, net, reason, exit_pct)
@@ -353,7 +372,11 @@ class PairMonitor:
         volume = (rq1 * p1 + rq2 * p2) * 2
         fees = volume * FEE_RATE
         funding = self.position["total_funding_paid"] * remaining_pct
-        net = pnl - fees - funding
+        
+        pnl = round(pnl, 2)
+        fees = round(fees, 2)
+        funding = round(funding, 2)
+        net = round(pnl - fees - funding, 2)
 
         pair_balance = CAPITAL_PER_PAIR + self.balance_contribution + net
         msg = (f"🔴 <b>{reason}</b> | {self.display}\n"
@@ -361,6 +384,7 @@ class PairMonitor:
                f"Gross: ${pnl:.2f} | Fees: ${fees:.2f} | Funding: ${funding:.2f}\n"
                f"<b>NET PnL: ${net:.2f}</b>\n"
                f"💼 Pair Balance: ${pair_balance:.2f}")
+        msg += self._get_summary_footer()
         logger.info(f"🔴 [{self.display}] {reason} | NET: ${net:.2f}")
         await send_telegram(msg)
         await self._log_trade(p1, p2, pnl, fees, funding, net, reason, remaining_pct)
@@ -525,13 +549,24 @@ class PairMonitor:
         volume = (close_q1 * p1 + close_q2 * p2) * 2
         fees = volume * FEE_RATE
         funding = self.position["total_funding_paid"] * pct
-        net = pnl - fees - funding
+        
+        pnl = round(pnl, 2)
+        fees = round(fees, 2)
+        funding = round(funding, 2)
+        net = round(pnl - fees - funding, 2)
 
         self.position["qty_1"] -= close_q1
         self.position["qty_2"] -= close_q2
         self.position["exits_done"] += 1
 
-        msg = f"⏰ <b>{reason}</b> | {self.display}\nClosing {pct*100:.0f}% (time-based)\nGross: ${pnl:.2f} | Fees: ${fees:.2f} | Funding: ${funding:.2f}\n<b>NET PnL: ${net:.2f}</b>"
+        pair_balance = CAPITAL_PER_PAIR + self.balance_contribution + net
+        msg = (f"⏰ <b>{reason}</b> | {self.display}\n"
+               f"Closing {pct*100:.0f}% (time-based)\n"
+               f"Gross: ${pnl:.2f} | Fees: ${fees:.2f} | Funding: ${funding:.2f}\n"
+               f"<b>NET PnL: ${net:.2f}</b>\n"
+               f"💼 Pair Balance: ${pair_balance:.2f}")
+        msg += self._get_summary_footer()
+        
         logger.info(f"⏰ [{self.display}] {reason} | Closing {pct*100:.0f}% | NET: ${net:.2f}")
         await send_telegram(msg)
         await self._log_trade(p1, p2, pnl, fees, funding, net, reason, pct)
@@ -566,6 +601,7 @@ class Orchestrator:
     def __init__(self):
         self.active_monitors: dict[str, asyncio.Task] = {}
         self.monitor_instances: dict[str, PairMonitor] = {}
+        self.last_scan_alert_time = datetime.min
 
     def active_count(self):
         # Clean up finished tasks
@@ -581,7 +617,7 @@ class Orchestrator:
         if key in self.active_monitors and not self.active_monitors[key].done():
             return  # Already running
 
-        monitor = PairMonitor(pair_info)
+        monitor = PairMonitor(pair_info, orchestrator=self)
         self.monitor_instances[key] = monitor
         task = asyncio.create_task(monitor.run())
         self.active_monitors[key] = task
@@ -599,7 +635,11 @@ class Orchestrator:
                 msg += f"\n🔥 Found {len(hot_pairs)} hot pairs (|Z| ≥ 2.0):\n{names}"
                 await send_telegram(msg)
             else:
-                msg += f"\n🧊 No pairs found with |Z| ≥ 2.0 right now."
+                now = datetime.now()
+                if (now - self.last_scan_alert_time).total_seconds() >= 3600:
+                    msg += f"\n🧊 No pairs found with |Z| ≥ 2.0 right now."
+                    await send_telegram(msg)
+                    self.last_scan_alert_time = now
                 logger.info(f"📡 Scanner Result: {len(winners)} pairs found, 0 hot.")
 
             slots = MAX_PAIRS - self.active_count()
