@@ -44,9 +44,9 @@ SCAN_INTERVAL_MINUTES = 5
 CSV_FILE = "stat_arb_log_v2.csv"
 FAPI_URL = "https://fapi.binance.com"
 
-ENTRY_TRANCHES = [(2.0, 0.30), (2.5, 0.30), (3.0, 0.40)]
-EXIT_TRANCHES = [(1.0, 0.40), (0.5, 0.30), (0.0, 0.30)]
-STOP_LOSS_Z = 5.0
+ENTRY_TRANCHES = [(2.0, 0.50), (2.5, 0.50)]
+EXIT_TRANCHES = [(1.0, 0.50), (0.0, 0.50)]
+STOP_LOSS_Z = 4.0
 
 SECTORS = {
     "Layer 1 Classic": ["ADAUSDT", "XRPUSDT", "XLMUSDT", "LTCUSDT", "BCHUSDT", "ETCUSDT"],
@@ -482,10 +482,18 @@ class PairMonitor:
         if abs_z >= STOP_LOSS_Z and self.position["tranches_filled"] == 0:
             return
 
-        # STOP LOSS
-        if self.position["tranches_filled"] > 0 and abs_z >= STOP_LOSS_Z:
-            await self._execute_full_exit("STOP_LOSS")
-            return
+        # STOP LOSS Check (Technical & Monetary)
+        if self.position["tranches_filled"] > 0:
+            if abs_z >= STOP_LOSS_Z:
+                await self._execute_full_exit(f"STOP_LOSS_Z (>= {STOP_LOSS_Z})")
+                return
+                
+            # Hard stop monetary limit (-1.5% of total capital)
+            max_loss_usd = CAPITAL_PER_PAIR * -0.015
+            current_net = self._get_current_net_pnl()
+            if current_net < max_loss_usd:
+                await self._execute_full_exit(f"STOP_LOSS_PNL (Net < ${max_loss_usd:.2f})")
+                return
 
         # STALE EXIT (24h + profit)
         if self.position["tranches_filled"] > 0:
