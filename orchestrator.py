@@ -209,6 +209,7 @@ class PairMonitor:
         self.hedge_ratio = pair_info["hedge_ratio"]
         self.spread_mean = pair_info["spread_mean"]
         self.spread_std = pair_info["spread_std"]
+        self.pair_info = pair_info  # Store the dict for easy saving
         self.prices = {self.sym1: 0.0, self.sym2: 0.0}
         self.ticks = 0
         self.active = True
@@ -240,8 +241,13 @@ class PairMonitor:
                 f"Capital: ${deployed:.0f} deployed / ${avail:.0f} idle")
 
     def _save_state(self):
+        state = {
+            "pair_info": self.pair_info,
+            "position": self.position,
+            "balance_contribution": self.balance_contribution
+        }
         with open(self.state_file, "w") as f:
-            json.dump({"position": self.position, "balance_contribution": self.balance_contribution}, f, indent=2, default=str)
+            json.dump(state, f, indent=2, default=str)
 
     def _load_state(self):
         if os.path.exists(self.state_file):
@@ -669,12 +675,40 @@ class Orchestrator:
             logger.error(f"Error in scan_and_launch: {e}")
             await send_telegram(f"⚠️ <b>Scanner Error</b>\n{e}")
 
+    async def _resume_monitors(self):
+        """Look for state_*.json files and reconstruct active monitors."""
+        try:
+            state_files = [f for f in os.listdir(".") if f.startswith("state_") and f.endswith(".json")]
+            resumed = 0
+            for f in state_files:
+                try:
+                    with open(f, "r") as file:
+                        data = json.load(file)
+                        pair_info = data.get("pair_info")
+                        if not pair_info:
+                            continue
+                        
+                        # Only resume if there's an active position
+                        pos = data.get("position", {})
+                        if pos.get("tranches_filled", 0) > 0:
+                            await self.launch_monitor(pair_info)
+                            resumed += 1
+                except Exception as e:
+                    logger.error(f"Error resuming monitor from {f}: {e}")
+            if resumed > 0:
+                logger.info(f"🔄 Resumed {resumed} active monitors from state files.")
+        except Exception as e:
+            logger.error(f"Error in _resume_monitors: {e}")
+
     async def run(self):
         logger.info("=" * 60)
         logger.info("  AUTONOMOUS STAT ARB ORCHESTRATOR")
         logger.info(f"  Capital/Pair: ${CAPITAL_PER_PAIR} | Max Pairs: {MAX_PAIRS}")
         logger.info(f"  Telegram: {'✅ Configured' if TELEGRAM_TOKEN else '❌ Not set'}")
         logger.info("=" * 60)
+
+        # Resume any existing monitors first
+        await self._resume_monitors()
 
         await send_telegram(
             f"🤖 <b>Bot Started</b>\n"
