@@ -627,6 +627,7 @@ class Orchestrator:
         self.accumulated_pnl = 0.0
         self.global_state_file = "global_state.json"
         self._load_global_state()
+        self.last_scan_winners = []
 
     def _load_global_state(self):
         """Load global PnL from JSON file."""
@@ -677,6 +678,7 @@ class Orchestrator:
         """Scan for pairs and auto-launch monitors for hot opportunities."""
         try:
             winners = await scan_all_pairs()
+            self.last_scan_winners = winners
             hot_pairs = [w for w in winners if w["abs_z"] >= 2.0]
             new_hot_pairs = [w for w in hot_pairs if w["pair_key"] not in self.active_monitors]
             
@@ -756,26 +758,26 @@ class Orchestrator:
         # Initial scan
         await self.scan_and_launch()
 
-        # Launch hourly summary and scanner as concurrent tasks
-        asyncio.create_task(self._hourly_summary_loop())
+        # Launch periodic summary and scanner as concurrent tasks
+        asyncio.create_task(self._periodic_summary_loop())
 
         # Periodic scanning loop
         while True:
             await asyncio.sleep(SCAN_INTERVAL_MINUTES * 60)
             await self.scan_and_launch()
 
-    async def _hourly_summary_loop(self):
-        """Send an hourly portfolio summary report to Telegram."""
+    async def _periodic_summary_loop(self):
+        """Send a periodic portfolio summary report to Telegram every 30 minutes."""
         while True:
-            await asyncio.sleep(3600)  # 1 hour
+            await asyncio.sleep(1800)  # 30 minutes
             try:
                 await self._send_summary()
             except Exception as e:
-                logger.error(f"Hourly summary error: {e}")
+                logger.error(f"Periodic summary error: {e}")
 
     async def _send_summary(self):
         """Build and send a portfolio summary to Telegram."""
-        lines = ["📊 <b>HOURLY PORTFOLIO SUMMARY</b>\n"]
+        lines = ["📊 <b>30-MINUTE PORTFOLIO SUMMARY</b>\n"]
         realized_total = (MAX_PAIRS * CAPITAL_PER_PAIR) + self.accumulated_pnl
         unrealized_total = 0.0
         active_pairs = 0
@@ -809,6 +811,23 @@ class Orchestrator:
         lines.append(f"\n💰 <b>Total Balance: ${total_balance:.2f}</b>")
         lines.append(f"📈 Active Pairs: {active_pairs}/{MAX_PAIRS}")
         lines.append(f"💤 Idle Slots: {idle_capital_count}")
+
+        # Add Scanner info
+        if self.last_scan_winners:
+            hot = [w for w in self.last_scan_winners if w["abs_z"] >= 2.0]
+            if hot:
+                lines.append(f"\n📡 <b>Scanner:</b> {len(hot)} hot pairs found.")
+                # Show top 3 available hot pairs (those not in monitors)
+                available = [h for h in hot if h["pair_key"] not in self.monitor_instances]
+                if available:
+                    avail_str = ", ".join([h["display"] for h in available[:3]])
+                    lines.append(f"   Available: {avail_str}")
+                else:
+                    lines.append(f"   (All hot pairs currently monitored)")
+            else:
+                lines.append(f"\n📡 <b>Scanner:</b> No pairs with |Z| ≥ 2.0")
+        else:
+            lines.append(f"\n📡 <b>Scanner:</b> Waiting for next scan...")
 
         await send_telegram("\n".join(lines))
 
