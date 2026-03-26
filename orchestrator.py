@@ -213,7 +213,7 @@ class PairMonitor:
         self.prices = {self.sym1: 0.0, self.sym2: 0.0}
         self.ticks = 0
         self.active = True
-        self.balance_contribution = 0.0  # Net PnL contribution to global balance
+        self.pnl_snapshot = 0.0  # Realized PnL of THIS trade session so far
         self.launched_at = datetime.now()  # Track when monitor was launched
         self.SEARCH_TIMEOUT_MINUTES = 30   # Auto-close if no entry after 30 min
 
@@ -244,7 +244,7 @@ class PairMonitor:
         state = {
             "pair_info": self.pair_info,
             "position": self.position,
-            "balance_contribution": self.balance_contribution
+            "pnl_snapshot": self.pnl_snapshot
         }
         with open(self.state_file, "w") as f:
             json.dump(state, f, indent=2, default=str)
@@ -255,7 +255,7 @@ class PairMonitor:
                 with open(self.state_file, "r") as f:
                     data = json.load(f)
                     self.position.update(data.get("position", {}))
-                    self.balance_contribution = data.get("balance_contribution", 0.0)
+                    self.pnl_snapshot = data.get("pnl_snapshot", 0.0)
                 if self.position["tranches_filled"] > 0:
                     logger.info(f"🔄 [{self.display}] Resumed trade: {self.position['side']} | Entries: {self.position['tranches_filled']}/{len(ENTRY_TRANCHES)} | Exits: {self.position['exits_done']}/{len(EXIT_TRANCHES)}")
             except Exception as e:
@@ -271,10 +271,17 @@ class PairMonitor:
         })
 
     async def _log_trade(self, p1, p2, gross_pnl, fees, funding, net_pnl, reason, exit_pct):
-        self.balance_contribution += net_pnl
+        self.pnl_snapshot += net_pnl
+        if self.orchestrator:
+            self.orchestrator.add_pnl(net_pnl)
+
         exit_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         avg_1 = self.position["spent_1"] / self.position["original_qty_1"] if self.position["original_qty_1"] > 0 else 0
         avg_2 = self.position["spent_2"] / self.position["original_qty_2"] if self.position["original_qty_2"] > 0 else 0
+        
+        # Calculate current global balance for logging
+        total_balance = (MAX_PAIRS * CAPITAL_PER_PAIR) + (self.orchestrator.accumulated_pnl if self.orchestrator else 0)
+
         with open(CSV_FILE, mode='a', newline='') as f:
             writer = csv.writer(f)
             writer.writerow([
@@ -283,7 +290,7 @@ class PairMonitor:
                 f"{exit_pct*100:.0f}%",
                 round(avg_1, 4), round(avg_2, 4), round(p1, 4), round(p2, 4),
                 round(gross_pnl, 2), round(fees, 2), round(funding, 2), round(net_pnl, 2),
-                reason, round(CAPITAL_PER_PAIR + self.balance_contribution, 2)
+                reason, round(total_balance, 2)
             ])
         logger.info(f"💾 [{self.display}] Logged ({reason}) | PnL: ${net_pnl:.2f}")
 
@@ -345,7 +352,8 @@ class PairMonitor:
         self.position["qty_1"] -= close_q1
         self.position["qty_2"] -= close_q2
 
-        pair_balance = CAPITAL_PER_PAIR + self.balance_contribution + net
+        # Pair Balance is capital + pnl realized for that pair instance
+        pair_balance = CAPITAL_PER_PAIR + self.pnl_snapshot + net
         msg = (f"🟢 <b>EXIT {self.position['exits_done']}/{len(EXIT_TRANCHES)}</b> | {self.display}\n"
                f"Reason: {reason} | Closed: {exit_pct*100:.0f}%\n"
                f"Gross: ${pnl:.2f} | Fees: ${fees:.2f} | Funding: ${funding_portion:.2f}\n"
@@ -384,7 +392,7 @@ class PairMonitor:
         funding = round(funding, 2)
         net = round(pnl - fees - funding, 2)
 
-        pair_balance = CAPITAL_PER_PAIR + self.balance_contribution + net
+        pair_balance = CAPITAL_PER_PAIR + self.pnl_snapshot + net
         msg = (f"🔴 <b>{reason}</b> | {self.display}\n"
                f"Closing remaining {remaining_pct*100:.0f}%\n"
                f"Gross: ${pnl:.2f} | Fees: ${fees:.2f} | Funding: ${funding:.2f}\n"
@@ -616,6 +624,34 @@ class Orchestrator:
         self.active_monitors: dict[str, asyncio.Task] = {}
         self.monitor_instances: dict[str, PairMonitor] = {}
         self.last_scan_alert_time = datetime.min
+        self.accumulated_pnl = 0.0
+        self.global_state_file = "global_state.json"
+        self._load_global_state()
+
+    def _load_global_state(self):
+        """Load global PnL from JSON file."""
+        if os.path.exists(self.global_state_file):
+            try:
+                with open(self.global_state_file, "r") as f:
+                    data = json.load(f)
+                    self.accumulated_pnl = data.get("accumulated_pnl", 0.0)
+                    logger.info(f"💰 Loaded global PnL: ${self.accumulated_pnl:.2f}")
+            except Exception as e:
+                logger.error(f"Error loading global state: {e}")
+
+    def _save_global_state(self):
+        """Save global PnL to JSON file."""
+        try:
+            with open(self.global_state_file, "w") as f:
+                json.dump({"accumulated_pnl": self.accumulated_pnl}, f, indent=2)
+        except Exception as e:
+            logger.error(f"Error saving global state: {e}")
+
+    def add_pnl(self, net_pnl):
+        """Add realized PnL to global tracking."""
+        self.accumulated_pnl += net_pnl
+        self._save_global_state()
+        logger.info(f"💰 Global PnL updated: ${self.accumulated_pnl:.2f} (added ${net_pnl:.2f})")
 
     def active_count(self):
         # Clean up finished tasks
@@ -647,14 +683,14 @@ class Orchestrator:
             now = datetime.now()
             # ONLY alert if we found NEW hot pairs OR if 1 hour has passed since the last alert
             if new_hot_pairs or (now - self.last_scan_alert_time).total_seconds() >= 3600:
-                msg = f"📡 <b>Scanner Update</b>\nFound {len(winners)} cointegrated pairs."
-                if hot_pairs:
-                    names = ", ".join([w["display"] for w in hot_pairs[:5]])
-                    msg += f"\n🔥 Found {len(hot_pairs)} hot pairs (|Z| ≥ 2.0):\n{names}"
-                else:
-                    msg += f"\n🧊 No pairs found with |Z| ≥ 2.0 right now."
+                # msg = f"📡 <b>Scanner Update</b>\nFound {len(winners)} cointegrated pairs."
+                # if hot_pairs:
+                #     names = ", ".join([w["display"] for w in hot_pairs[:5]])
+                #     msg += f"\n🔥 Found {len(hot_pairs)} hot pairs (|Z| ≥ 2.0):\n{names}"
+                # else:
+                #     msg += f"\n🧊 No pairs found with |Z| ≥ 2.0 right now."
                 
-                await send_telegram(msg)
+                # await send_telegram(msg)
                 self.last_scan_alert_time = now
                 
             logger.info(f"📡 Scanner Result: {len(winners)} pairs found, {len(hot_pairs)} hot.")
@@ -720,51 +756,59 @@ class Orchestrator:
         # Initial scan
         await self.scan_and_launch()
 
-        # Launch daily summary and scanner as concurrent tasks
-        asyncio.create_task(self._daily_summary_loop())
+        # Launch hourly summary and scanner as concurrent tasks
+        asyncio.create_task(self._hourly_summary_loop())
 
         # Periodic scanning loop
         while True:
             await asyncio.sleep(SCAN_INTERVAL_MINUTES * 60)
             await self.scan_and_launch()
 
-    async def _daily_summary_loop(self):
-        """Send a daily summary report to Telegram every 24 hours."""
+    async def _hourly_summary_loop(self):
+        """Send an hourly portfolio summary report to Telegram."""
         while True:
-            await asyncio.sleep(86400)  # 24 hours
+            await asyncio.sleep(3600)  # 1 hour
             try:
                 await self._send_summary()
             except Exception as e:
-                logger.error(f"Daily summary error: {e}")
+                logger.error(f"Hourly summary error: {e}")
 
     async def _send_summary(self):
         """Build and send a portfolio summary to Telegram."""
-        lines = ["📊 <b>DAILY PORTFOLIO SUMMARY</b>\n"]
-        total_balance = 0.0
+        lines = ["📊 <b>HOURLY PORTFOLIO SUMMARY</b>\n"]
+        realized_total = (MAX_PAIRS * CAPITAL_PER_PAIR) + self.accumulated_pnl
+        unrealized_total = 0.0
         active_pairs = 0
 
+        monitors_rendered = set()
+
         for key, monitor in self.monitor_instances.items():
-            pair_bal = CAPITAL_PER_PAIR + monitor.balance_contribution
-            total_balance += pair_bal
-            pnl_str = f"+${monitor.balance_contribution:.2f}" if monitor.balance_contribution >= 0 else f"-${abs(monitor.balance_contribution):.2f}"
+            monitors_rendered.add(key)
+            pair_bal = CAPITAL_PER_PAIR + monitor.pnl_snapshot
+            pnl_str = f"+${monitor.pnl_snapshot:.2f}" if monitor.pnl_snapshot >= 0 else f"-${abs(monitor.pnl_snapshot):.2f}"
 
             if monitor.position["tranches_filled"] > 0:
                 active_pairs += 1
                 spread = monitor.prices[monitor.sym1] - (monitor.hedge_ratio * monitor.prices[monitor.sym2])
                 z = (spread - monitor.spread_mean) / monitor.spread_std if monitor.spread_std != 0 else 0
                 funding = monitor.position['total_funding_paid']
+                
+                cur_net = monitor._get_current_net_pnl()
+                unrealized_total += cur_net
+                
                 lines.append(f"  📍 <b>{monitor.display}</b>: Z={z:.2f} | In:{monitor.position['tranches_filled']}/{len(ENTRY_TRANCHES)} Out:{monitor.position['exits_done']}/{len(EXIT_TRANCHES)} | Funding: ${funding:.2f}")
+                lines.append(f"     PnL: {pnl_str} | Floating: ${cur_net:+.2f} | Balance: ${pair_bal:.2f}")
             else:
                 lines.append(f"  🔍 <b>{monitor.display}</b>: Searching")
+                lines.append(f"     PnL: {pnl_str} | Balance: ${pair_bal:.2f}")
 
-            lines.append(f"     PnL: {pnl_str} | Balance: ${pair_bal:.2f}")
-
-        idle_capital = (MAX_PAIRS - len(self.monitor_instances)) * CAPITAL_PER_PAIR
-        total_balance += idle_capital
+        idle_capital_count = MAX_PAIRS - len(self.monitor_instances)
+        
+        total_balance = realized_total + unrealized_total
 
         lines.append(f"\n💰 <b>Total Balance: ${total_balance:.2f}</b>")
         lines.append(f"📈 Active Pairs: {active_pairs}/{MAX_PAIRS}")
-        lines.append(f"💤 Idle Capital: ${idle_capital:.2f}")
+        lines.append(f"💤 Idle Slots: {idle_capital_count}")
 
         await send_telegram("\n".join(lines))
 
