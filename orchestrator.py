@@ -35,6 +35,7 @@ CHAT_ID = os.environ.get("CHAT_ID", "")
 CAPITAL_PER_PAIR = float(os.environ.get("CAPITAL_PER_PAIR", "1000"))
 MAX_PAIRS = int(os.environ.get("MAX_PAIRS", "3"))
 STOP_LOSS_USD = float(os.environ.get("STOP_LOSS_USD", "15.0"))
+PORTFOLIO_TP_USD = float(os.environ.get("PORTFOLIO_TP_USD", "0"))  # 0 = disabled
 FEE_RATE = 0.0004
 FUNDING_RATE = 0.0001  # 0.01% per 8 hours
 FUNDING_INTERVAL_HOURS = 8
@@ -800,15 +801,18 @@ class Orchestrator:
             f"Capital/Pair: ${CAPITAL_PER_PAIR}\n"
             f"Max Pairs: {MAX_PAIRS}\n"
             f"Stop Loss: ${STOP_LOSS_USD}\n"
+            f"Portfolio TP: {'$' + str(PORTFOLIO_TP_USD) if PORTFOLIO_TP_USD > 0 else 'Disabled'}\n"
             f"Scan Interval: {SCAN_INTERVAL_MINUTES}min"
         )
 
         # Initial scan
         await self.scan_and_launch()
 
-        # Launch daily summary, periodic summary and scanner
+        # Launch daily summary, periodic summary, scanner and portfolio TP
         asyncio.create_task(self._daily_report_loop())
         asyncio.create_task(self._periodic_summary_loop())
+        if PORTFOLIO_TP_USD > 0:
+            asyncio.create_task(self._portfolio_tp_loop())
 
         # Send an initial summary immediately
         try:
@@ -828,6 +832,43 @@ class Orchestrator:
                 await self._send_summary()
             except Exception as e:
                 logger.error(f"Periodic summary error: {e}")
+
+    async def _portfolio_tp_loop(self):
+        """Check total floating PnL every 30s and close all if above PORTFOLIO_TP_USD."""
+        while True:
+            await asyncio.sleep(30)  # Check every 30 seconds
+            try:
+                total_floating = 0.0
+                active_monitors = []
+                for key, monitor in self.monitor_instances.items():
+                    if monitor.position["tranches_filled"] > 0:
+                        total_floating += monitor._get_current_net_pnl()
+                        active_monitors.append(monitor)
+
+                if total_floating >= PORTFOLIO_TP_USD and len(active_monitors) > 0:
+                    logger.warning(f"🎯 PORTFOLIO TP HIT! Floating ${total_floating:.2f} >= ${PORTFOLIO_TP_USD}")
+                    
+                    # Close all active positions
+                    for monitor in active_monitors:
+                        try:
+                            await monitor._execute_full_exit(f"PORTFOLIO_TP (Total ${total_floating:.2f})")
+                        except Exception as e:
+                            logger.error(f"Error closing {monitor.display}: {e}")
+
+                    await send_telegram(
+                        f"🎯 <b>PORTFOLIO TAKE PROFIT</b>\n\n"
+                        f"Total Floating was: ${total_floating:.2f}\n"
+                        f"Threshold: ${PORTFOLIO_TP_USD}\n"
+                        f"Closed {len(active_monitors)} positions.\n\n"
+                        f"🔄 Scanning for new opportunities..."
+                    )
+
+                    # Trigger a new scan immediately
+                    await asyncio.sleep(5)
+                    await self.scan_and_launch()
+
+            except Exception as e:
+                logger.error(f"Portfolio TP check error: {e}")
 
     async def _daily_report_loop(self):
         """Send a daily performance report every 24 hours."""
