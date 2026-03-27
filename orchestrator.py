@@ -768,7 +768,8 @@ class Orchestrator:
             resumed = 0
             for f in state_files:
                 try:
-                    with open(f, "r") as file:
+                    full_path = os.path.join(DATA_DIR, f)
+                    with open(full_path, "r") as file:
                         data = json.load(file)
                         pair_info = data.get("pair_info")
                         if not pair_info:
