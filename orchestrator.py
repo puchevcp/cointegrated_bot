@@ -529,12 +529,13 @@ class PairMonitor:
             max_loss_usd = -abs(STOP_LOSS_USD)
             current_net = self._get_current_net_pnl()
             
-            # 🔥 DEBUG: Every 100 ticks or if near loss
-            if self.ticks % 100 == 0 or current_net < (max_loss_usd + 3):
-                logger.info(f"🛡️ [{self.display}] SL Check: Net ${current_net:.2f} vs Limit ${max_loss_usd:.2f} (Z: {z_score:.2f})")
+            # Log SL check every 50 ticks
+            if self.ticks % 50 == 0:
+                logger.info(f"🛡️ [{self.display}] SL Check: Net=${current_net:.2f} | Limit=${max_loss_usd:.2f} | STOP_LOSS_USD={STOP_LOSS_USD}")
 
             if current_net < max_loss_usd:
-                await self._execute_full_exit(f"STOP_LOSS_PNL (Net < ${max_loss_usd:.2f})")
+                logger.warning(f"🚨 [{self.display}] SL TRIGGERED! Net=${current_net:.2f} < Limit=${max_loss_usd:.2f}")
+                await self._execute_full_exit(f"STOP_LOSS_PNL (Net ${current_net:.2f} < ${max_loss_usd:.2f})")
                 return
 
         # STALE EXIT (24h + profit)
@@ -791,6 +792,7 @@ class Orchestrator:
         logger.info("=" * 60)
         logger.info("  AUTONOMOUS STAT ARB ORCHESTRATOR")
         logger.info(f"  Capital/Pair: ${CAPITAL_PER_PAIR} | Max Pairs: {MAX_PAIRS}")
+        logger.info(f"  STOP_LOSS_USD: ${STOP_LOSS_USD} | PORTFOLIO_TP_USD: ${PORTFOLIO_TP_USD}")
         logger.info(f"  Telegram: {'✅ Configured' if TELEGRAM_TOKEN else '❌ Not set'}")
         logger.info("=" * 60)
 
