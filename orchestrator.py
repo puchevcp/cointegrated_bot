@@ -279,9 +279,9 @@ class PairMonitor:
     async def _log_trade(self, p1, p2, gross_pnl, fees, funding, net_pnl, reason, exit_pct):
         self.pnl_snapshot += net_pnl
         if self.orchestrator:
-            self.orchestrator.add_pnl(net_pnl)
-            # Log to daily history
             is_sl = "STOP_LOSS" in reason
+            self.orchestrator.add_pnl(net_pnl, is_sl=is_sl)
+            # Log to daily history
             self.orchestrator.add_to_history({
                 "pair": self.display,
                 "type": "SL" if is_sl else "TP",
@@ -654,6 +654,8 @@ class Orchestrator:
         self.monitor_instances: dict[str, PairMonitor] = {}
         self.last_scan_alert_time = datetime.min
         self.accumulated_pnl = 0.0
+        self.accumulated_tp = 0.0
+        self.accumulated_sl = 0.0
         self.global_state_file = os.path.join(DATA_DIR, "global_state.json")
         self._load_global_state()
         self.last_scan_winners = []
@@ -685,7 +687,9 @@ class Orchestrator:
                 with open(self.global_state_file, "r") as f:
                     data = json.load(f)
                     self.accumulated_pnl = data.get("accumulated_pnl", 0.0)
-                    logger.info(f"💰 Loaded global PnL: ${self.accumulated_pnl:.2f}")
+                    self.accumulated_tp = data.get("accumulated_tp", 0.0)
+                    self.accumulated_sl = data.get("accumulated_sl", 0.0)
+                    logger.info(f"💰 Loaded global state: PnL=${self.accumulated_pnl:.2f} | TP=${self.accumulated_tp:.2f} | SL=${self.accumulated_sl:.2f}")
             except Exception as e:
                 logger.error(f"Error loading global state: {e}")
 
@@ -693,15 +697,23 @@ class Orchestrator:
         """Save global PnL to JSON file."""
         try:
             with open(self.global_state_file, "w") as f:
-                json.dump({"accumulated_pnl": self.accumulated_pnl}, f, indent=2)
+                json.dump({
+                    "accumulated_pnl": self.accumulated_pnl,
+                    "accumulated_tp": self.accumulated_tp,
+                    "accumulated_sl": self.accumulated_sl
+                }, f, indent=2)
         except Exception as e:
             logger.error(f"Error saving global state: {e}")
 
-    def add_pnl(self, net_pnl):
+    def add_pnl(self, net_pnl, is_sl=False):
         """Add realized PnL to global tracking."""
         self.accumulated_pnl += net_pnl
+        if is_sl:
+            self.accumulated_sl += abs(net_pnl)
+        else:
+            self.accumulated_tp += net_pnl
         self._save_global_state()
-        logger.info(f"💰 Global PnL updated: ${self.accumulated_pnl:.2f} (added ${net_pnl:.2f})")
+        logger.info(f"💰 Global PnL updated: ${self.accumulated_pnl:.2f} (added ${net_pnl:.2f}) | TP=${self.accumulated_tp:.2f} | SL=${self.accumulated_sl:.2f}")
 
     def active_count(self):
         # Clean up finished tasks
@@ -949,6 +961,8 @@ class Orchestrator:
         total_balance = realized_total + unrealized_total
 
         lines.append(f"\n💰 <b>Total Balance: ${total_balance:.2f}</b>")
+        lines.append(f"✅ TP Acumulado: ${self.accumulated_tp:.2f}")
+        lines.append(f"❌ SL Acumulado: -${self.accumulated_sl:.2f}")
         lines.append(f"📈 Active Pairs: {active_pairs}/{MAX_PAIRS}")
         lines.append(f"💤 Idle Slots: {idle_capital_count}")
 
