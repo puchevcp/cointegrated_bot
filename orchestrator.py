@@ -806,6 +806,16 @@ class Orchestrator:
         logger.info(f"  Capital/Pair: ${CAPITAL_PER_PAIR} | Max Pairs: {MAX_PAIRS}")
         logger.info(f"  STOP_LOSS_USD: ${STOP_LOSS_USD} | PORTFOLIO_TP_USD: ${PORTFOLIO_TP_USD}")
         logger.info(f"  Telegram: {'✅ Configured' if TELEGRAM_TOKEN else '❌ Not set'}")
+        logger.info(f"  DATA_DIR: {DATA_DIR}")
+        logger.info(f"  /etc/bot_data exists: {os.path.exists('/etc/bot_data')}")
+        try:
+            files_in_data = os.listdir(DATA_DIR)
+            logger.info(f"  Files in DATA_DIR: {files_in_data}")
+        except Exception as e:
+            logger.error(f"  Cannot list DATA_DIR: {e}")
+        logger.info(f"  Global State File: {self.global_state_file}")
+        logger.info(f"  Global State Exists: {os.path.exists(self.global_state_file)}")
+        logger.info(f"  Accumulated PnL: ${self.accumulated_pnl:.2f} | TP: ${self.accumulated_tp:.2f} | SL: ${self.accumulated_sl:.2f}")
         logger.info("=" * 60)
 
         # Resume any existing monitors first
