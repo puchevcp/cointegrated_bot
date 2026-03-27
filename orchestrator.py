@@ -810,15 +810,20 @@ class Orchestrator:
         asyncio.create_task(self._daily_report_loop())
         asyncio.create_task(self._periodic_summary_loop())
 
+        # Send an initial summary immediately
+        try:
+            await self._send_summary()
+        except: pass
+
         # Periodic scanning loop
         while True:
             await asyncio.sleep(SCAN_INTERVAL_MINUTES * 60)
             await self.scan_and_launch()
 
     async def _periodic_summary_loop(self):
-        """Send a periodic portfolio summary report to Telegram every 30 minutes."""
+        """Send a periodic portfolio summary report to Telegram every 10 minutes."""
         while True:
-            await asyncio.sleep(1800)  # 30 minutes
+            await asyncio.sleep(600)  # 10 minutes
             try:
                 await self._send_summary()
             except Exception as e:
@@ -868,7 +873,7 @@ class Orchestrator:
 
     async def _send_summary(self):
         """Build and send a portfolio summary to Telegram."""
-        lines = ["📊 <b>30-MINUTE PORTFOLIO SUMMARY</b>\n"]
+        lines = ["📊 <b>10-MINUTE PORTFOLIO SUMMARY</b>\n"]
         realized_total = (MAX_PAIRS * CAPITAL_PER_PAIR) + self.accumulated_pnl
         unrealized_total = 0.0
         active_pairs = 0
