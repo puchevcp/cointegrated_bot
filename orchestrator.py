@@ -34,6 +34,7 @@ TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 CHAT_ID = os.environ.get("CHAT_ID", "")
 CAPITAL_PER_PAIR = float(os.environ.get("CAPITAL_PER_PAIR", "1000"))
 MAX_PAIRS = int(os.environ.get("MAX_PAIRS", "3"))
+STOP_LOSS_USD = float(os.environ.get("STOP_LOSS_USD", "15.0"))
 FEE_RATE = 0.0004
 FUNDING_RATE = 0.0001  # 0.01% per 8 hours
 FUNDING_INTERVAL_HOURS = 8
@@ -502,8 +503,8 @@ class PairMonitor:
                 await self._execute_full_exit(f"STOP_LOSS_Z (>= {STOP_LOSS_Z})")
                 return
                 
-            # Hard stop monetary limit (-1.5% of total capital)
-            max_loss_usd = CAPITAL_PER_PAIR * -0.015
+            # Hard stop monetary limit (User defined or default $15)
+            max_loss_usd = -abs(STOP_LOSS_USD)
             current_net = self._get_current_net_pnl()
             if current_net < max_loss_usd:
                 await self._execute_full_exit(f"STOP_LOSS_PNL (Net < ${max_loss_usd:.2f})")
@@ -752,6 +753,7 @@ class Orchestrator:
             f"🤖 <b>Bot Started</b>\n"
             f"Capital/Pair: ${CAPITAL_PER_PAIR}\n"
             f"Max Pairs: {MAX_PAIRS}\n"
+            f"Stop Loss: ${STOP_LOSS_USD}\n"
             f"Scan Interval: {SCAN_INTERVAL_MINUTES}min"
         )
 
