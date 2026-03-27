@@ -42,8 +42,9 @@ TIME_STOP_DAY_1 = 3   # Close 50% after 3 days
 TIME_STOP_DAY_2 = 5   # Close remaining after 5 days
 STALE_EXIT_HOURS = 24  # Force close if in profit after 24h to free up slot
 SCAN_INTERVAL_MINUTES = 5
-CSV_FILE = "stat_arb_log_v2.csv"
 FAPI_URL = "https://fapi.binance.com"
+DATA_DIR = "/etc/bot_data" if os.path.exists("/etc/bot_data") else "."
+CSV_FILE = os.path.join(DATA_DIR, "stat_arb_log_v2.csv")
 
 ENTRY_TRANCHES = [(2.0, 0.50), (2.5, 0.50)]
 EXIT_TRANCHES = [(1.0, 0.50), (0.0, 0.50)]
@@ -187,6 +188,9 @@ async def scan_all_pairs():
 # ═══════════════════════════════════════════════════════════════
 #  CSV LOGGING
 # ═══════════════════════════════════════════════════════════════
+if not os.path.exists(DATA_DIR):
+    os.makedirs(DATA_DIR, exist_ok=True)
+
 if not os.path.exists(CSV_FILE):
     with open(CSV_FILE, mode='w', newline='') as f:
         writer = csv.writer(f)
@@ -218,7 +222,7 @@ class PairMonitor:
         self.launched_at = datetime.now()  # Track when monitor was launched
         self.SEARCH_TIMEOUT_MINUTES = 30   # Auto-close if no entry after 30 min
 
-        self.state_file = f"state_{self.pair_key}.json"
+        self.state_file = os.path.join(DATA_DIR, f"state_{self.pair_key}.json")
         self.position = {
             "side": None, "tranches_filled": 0, "exits_done": 0,
             "spent_1": 0.0, "spent_2": 0.0,
@@ -275,6 +279,15 @@ class PairMonitor:
         self.pnl_snapshot += net_pnl
         if self.orchestrator:
             self.orchestrator.add_pnl(net_pnl)
+            # Log to daily history
+            is_sl = "STOP_LOSS" in reason
+            self.orchestrator.add_to_history({
+                "pair": self.display,
+                "type": "SL" if is_sl else "TP",
+                "pnl": net_pnl,
+                "reason": reason,
+                "time": datetime.now().strftime("%H:%M:%S")
+            })
 
         exit_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         avg_1 = self.position["spent_1"] / self.position["original_qty_1"] if self.position["original_qty_1"] > 0 else 0
@@ -316,10 +329,18 @@ class PairMonitor:
         self.position["original_qty_2"] = self.position["qty_2"]
 
         total_invested = self.position["spent_1"] + self.position["spent_2"]
+        
+        # Determine labels for legs
+        if side == "LONG_1_SHORT_2":
+            leg1, leg2 = f"LONG 🟢 {self.sym1}", f"SHORT 🔴 {self.sym2}"
+        else:
+            leg1, leg2 = f"SHORT 🔴 {self.sym1}", f"LONG 🟢 {self.sym2}"
+
         msg = (f"🏦 <b>ENTRY {idx+1}/{len(ENTRY_TRANCHES)}</b> | {self.display}\n"
-               f"Side: {side} | Z: {z_score:.2f}\n"
-               f"Capital: ${capital:.0f} | Total Invested: ${total_invested:.0f}\n"
-               f"Avg {self.sym1}: {p1:.4f}")
+               f"Z: {z_score:.2f} | Capital: ${capital:.0f}\n"
+               f"📍 {leg1}: {p1:.4f}\n"
+               f"📍 {leg2}: {p2:.4f}\n"
+               f"💰 Total Invested: ${total_invested:.0f}")
         msg += self._get_summary_footer()
         logger.warning(f"🏦 [{self.display}] ENTRY {idx+1}/{len(ENTRY_TRANCHES)} | {side} | Z: {z_score:.2f} | ${capital:.0f}")
         await send_telegram(msg)
@@ -506,6 +527,11 @@ class PairMonitor:
             # Hard stop monetary limit (User defined or default $15)
             max_loss_usd = -abs(STOP_LOSS_USD)
             current_net = self._get_current_net_pnl()
+            
+            # 🔥 DEBUG: Every 100 ticks or if near loss
+            if self.ticks % 100 == 0 or current_net < (max_loss_usd + 3):
+                logger.info(f"🛡️ [{self.display}] SL Check: Net ${current_net:.2f} vs Limit ${max_loss_usd:.2f} (Z: {z_score:.2f})")
+
             if current_net < max_loss_usd:
                 await self._execute_full_exit(f"STOP_LOSS_PNL (Net < ${max_loss_usd:.2f})")
                 return
@@ -626,9 +652,29 @@ class Orchestrator:
         self.monitor_instances: dict[str, PairMonitor] = {}
         self.last_scan_alert_time = datetime.min
         self.accumulated_pnl = 0.0
-        self.global_state_file = "global_state.json"
+        self.global_state_file = os.path.join(DATA_DIR, "global_state.json")
         self._load_global_state()
         self.last_scan_winners = []
+        self.daily_history = []  # List of dicts with daily results
+        self.history_file = os.path.join(DATA_DIR, "daily_history.json")
+        self._load_history()
+
+    def _load_history(self):
+        if os.path.exists(self.history_file):
+            try:
+                with open(self.history_file, "r") as f:
+                    self.daily_history = json.load(f)
+            except: pass
+
+    def _save_history(self):
+        try:
+            with open(self.history_file, "w") as f:
+                json.dump(self.daily_history, f)
+        except: pass
+
+    def add_to_history(self, entry):
+        self.daily_history.append(entry)
+        self._save_history()
 
     def _load_global_state(self):
         """Load global PnL from JSON file."""
@@ -717,7 +763,7 @@ class Orchestrator:
     async def _resume_monitors(self):
         """Look for state_*.json files and reconstruct active monitors."""
         try:
-            state_files = [f for f in os.listdir(".") if f.startswith("state_") and f.endswith(".json")]
+            state_files = [f for f in os.listdir(DATA_DIR) if f.startswith("state_") and f.endswith(".json")]
             resumed = 0
             for f in state_files:
                 try:
@@ -760,7 +806,8 @@ class Orchestrator:
         # Initial scan
         await self.scan_and_launch()
 
-        # Launch periodic summary and scanner as concurrent tasks
+        # Launch daily summary, periodic summary and scanner
+        asyncio.create_task(self._daily_report_loop())
         asyncio.create_task(self._periodic_summary_loop())
 
         # Periodic scanning loop
@@ -776,6 +823,48 @@ class Orchestrator:
                 await self._send_summary()
             except Exception as e:
                 logger.error(f"Periodic summary error: {e}")
+
+    async def _daily_report_loop(self):
+        """Send a daily performance report every 24 hours."""
+        while True:
+            # Wait for 24 hours
+            await asyncio.sleep(86400)
+            try:
+                await self._send_daily_report()
+            except Exception as e:
+                logger.error(f"Daily report error: {e}")
+
+    async def _send_daily_report(self):
+        """Build and send a summary of all trades closed in the last 24h."""
+        if not self.daily_history:
+            return # Don't send if no trades closed
+
+        lines = ["📅 <b>DAILY PERFORMANCE REPORT</b>\n"]
+        total_pnl = 0.0
+        by_pair = {} # pair -> {"TP": 0, "SL": 0, "pnl": 0}
+
+        for trade in self.daily_history:
+            total_pnl += trade['pnl']
+            p = trade['pair']
+            if p not in by_pair: by_pair[p] = {"TP": 0, "SL": 0, "pnl": 0}
+            by_pair[p][trade['type']] += 1
+            by_pair[p]['pnl'] += trade['pnl']
+            
+            pnl_icon = "🟢" if trade['pnl'] >= 0 else "🔴"
+            lines.append(f"{pnl_icon} <b>{trade['pair']}</b> ({trade['type']}): ${trade['pnl']:.2f} at {trade['time']}")
+
+        lines.append(f"\n📊 <b>Stats by Pair:</b>")
+        for p, stats in by_pair.items():
+            lines.append(f"  📍 {p}: {stats['TP']} TP / {stats['SL']} SL | Net: ${stats['pnl']:.2f}")
+
+        lines.append(f"\n💰 <b>Daily Total: ${total_pnl:.2f}</b>")
+        
+        await send_telegram("\n".join(lines))
+        
+        # Clear history for next 24h
+        self.daily_history = []
+        if os.path.exists(self.history_file):
+            os.remove(self.history_file)
 
     async def _send_summary(self):
         """Build and send a portfolio summary to Telegram."""
