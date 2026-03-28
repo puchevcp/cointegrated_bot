@@ -610,7 +610,7 @@ class PairMonitor:
         self.position["qty_2"] -= close_q2
         self.position["exits_done"] += 1
 
-        pair_balance = CAPITAL_PER_PAIR + self.balance_contribution + net
+        pair_balance = CAPITAL_PER_PAIR + self.pnl_snapshot + net
         msg = (f"⏰ <b>{reason}</b> | {self.display}\n"
                f"Closing {pct*100:.0f}% (time-based)\n"
                f"Gross: ${pnl:.2f} | Fees: ${fees:.2f} | Funding: ${funding:.2f}\n"
@@ -1015,7 +1015,7 @@ async def health_handler(request):
                 "in_trade": monitor.position["tranches_filled"] > 0,
                 "entries": f"{monitor.position['tranches_filled']}/{len(ENTRY_TRANCHES)}",
                 "exits": f"{monitor.position['exits_done']}/{len(EXIT_TRANCHES)}",
-                "pnl": round(monitor.balance_contribution, 2),
+                "pnl": round(monitor.pnl_snapshot, 2),
             }
             status["monitors"].append(m)
     from aiohttp import web
