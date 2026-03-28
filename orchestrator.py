@@ -239,7 +239,7 @@ class PairMonitor:
         if not self.orchestrator:
             return ""
         active = self.orchestrator.active_count()
-        total_pnl = sum([m.balance_contribution for m in self.orchestrator.monitor_instances.values()])
+        total_pnl = sum([m.pnl_snapshot for m in self.orchestrator.monitor_instances.values()])
         avail = (MAX_PAIRS - active) * CAPITAL_PER_PAIR
         deployed = active * CAPITAL_PER_PAIR
         return (f"\n\n📊 <b>Portfolio Update</b>\n"
