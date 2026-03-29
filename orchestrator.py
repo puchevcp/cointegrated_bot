@@ -32,10 +32,10 @@ logger = logging.getLogger("Orchestrator")
 # ═══════════════════════════════════════════════════════════════
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 CHAT_ID = os.environ.get("CHAT_ID", "")
-CAPITAL_PER_PAIR = float(os.environ.get("CAPITAL_PER_PAIR", "1000"))
-MAX_PAIRS = int(os.environ.get("MAX_PAIRS", "3"))
-STOP_LOSS_USD = float(os.environ.get("STOP_LOSS_USD", "15.0"))
-PORTFOLIO_TP_USD = float(os.environ.get("PORTFOLIO_TP_USD", "0"))  # 0 = disabled
+CAPITAL_PER_PAIR = float(os.environ.get("CAPITAL_PER_PAIR", "500.0"))
+MAX_PAIRS = int(os.environ.get("MAX_PAIRS", "6"))
+STOP_LOSS_USD = float(os.environ.get("STOP_LOSS_USD", "40.0"))
+PORTFOLIO_TP_USD = float(os.environ.get("PORTFOLIO_TP_USD", "80.0"))
 FEE_RATE = 0.0004
 FUNDING_RATE = 0.0001  # 0.01% per 8 hours
 FUNDING_INTERVAL_HOURS = 8
@@ -47,19 +47,17 @@ FAPI_URL = "https://fapi.binance.com"
 DATA_DIR = "/etc/bot_data" if os.path.exists("/etc/bot_data") else "."
 CSV_FILE = os.path.join(DATA_DIR, "stat_arb_log_v2.csv")
 
-ENTRY_TRANCHES = [(2.0, 0.50), (2.5, 0.50)]
+ENTRY_TRANCHES = [(2.3, 0.50), (2.8, 0.50)]
 EXIT_TRANCHES = [(1.0, 0.50), (0.0, 0.50)]
-STOP_LOSS_Z = 4.0
+STOP_LOSS_Z = 4.5
 
-SECTORS = {
-    "Layer 1 Classic": ["ADAUSDT", "XRPUSDT", "XLMUSDT", "LTCUSDT", "BCHUSDT", "ETCUSDT"],
-    "Smart Contracts": ["SOLUSDT", "AVAXUSDT", "DOTUSDT", "NEARUSDT", "ATOMUSDT", "APTUSDT", "SUIUSDT"],
-    "DeFi": ["UNIUSDT", "SUSHIUSDT", "AAVEUSDT", "LDOUSDT", "MKRUSDT", "CRVUSDT"],
-    "Meme": ["DOGEUSDT", "1000SHIBUSDT", "1000PEPEUSDT", "1000FLOKIUSDT"],
-    "Gaming / Metaverse": ["SANDUSDT", "MANAUSDT", "GALAUSDT", "AXSUSDT", "ENJUSDT"],
-    "AI / Data": ["FETUSDT", "RNDRUSDT", "THETAUSDT"],
-    "Infrastructure": ["LINKUSDT", "FILUSDT", "ARUSDT", "GRTUSDT"],
-}
+# 💎 THE DIAMOND WHITELIST (Top 10 Validated Pairs)
+DIAMOND_WHITELIST = [
+    ("AVAXUSDT", "SUIUSDT"), ("XRPUSDT", "AVAXUSDT"), ("MANAUSDT", "XRPUSDT"),
+    ("AXSUSDT", "MKRUSDT"), ("AAVEUSDT", "CRVUSDT"), ("ENJUSDT", "AAVEUSDT"),
+    ("MANAUSDT", "AXSUSDT"), ("MANAUSDT", "AAVEUSDT"), ("SANDUSDT", "GALAUSDT"),
+    ("SOLUSDT", "MKRUSDT")
+]
 
 # ═══════════════════════════════════════════════════════════════
 #  TELEGRAM NOTIFICATIONS
@@ -121,7 +119,7 @@ def test_pair(df1, df2, sym1, sym2):
         spread = asset1 - (hedge_ratio * asset2)
         adf_result = adfuller(spread, autolag='AIC')
         p_value = adf_result[1]
-        if p_value >= 0.05:
+        if p_value >= 0.03:
             return None
         window = 480
         rolling_mean = spread.rolling(window=window).mean()
@@ -143,18 +141,16 @@ def test_pair(df1, df2, sym1, sym2):
         return None
 
 async def scan_all_pairs():
-    """Scan all sector pairs and return ranked results."""
+    """Scan ONLY Diamond Whitelist pairs and return ranked results."""
     all_symbols = set()
-    for syms in SECTORS.values():
-        all_symbols.update(syms)
+    for s1, s2 in DIAMOND_WHITELIST:
+        all_symbols.add(s1)
+        all_symbols.add(s2)
     all_symbols = sorted(all_symbols)
 
-    logger.info(f"📡 Scanner: Downloading {len(all_symbols)} symbols...")
+    logger.info(f"📡 Scanner (Diamond): Downloading {len(all_symbols)} symbols...")
     price_data = {}
-    
-    # 💥 CHANGE: Limit concurrency to avoid being dropped by Binance
     sem = asyncio.Semaphore(5)
-    
     async with aiohttp.ClientSession() as session:
         tasks_dict = {sym: fetch_klines(session, sym, sem=sem) for sym in all_symbols}
         results = await asyncio.gather(*tasks_dict.values())
@@ -162,28 +158,17 @@ async def scan_all_pairs():
             if result is not None:
                 price_data[sym] = result
 
-    logger.info(f"📡 Scanner: Download complete. Successfully fetched {len(price_data)}/{len(all_symbols)} symbols.")
-    logger.info(f"📡 Scanner: Running cointegration math on free-tier CPU... (this may take up to 60s)")
-
     winners = []
     pairs_tested = 0
-    for sector_syms in SECTORS.values():
-        available = [s for s in sector_syms if s in price_data]
-        for s1, s2 in combinations(available, 2):
-            # 🔥 CRITICAL FIX: Run CPU-bound math in a background thread
-            # so the asyncio event loop (and HTTP health server) NEVER freezes.
-            result = await asyncio.to_thread(test_pair, price_data[s1], price_data[s2], s1, s2)
-            if result:
-                winners.append(result)
-            pairs_tested += 1
-            
-            if pairs_tested % 10 == 0:
-                logger.info(f"📡 Scanner progress: {pairs_tested} pairs analyzed...")
-                # Tiny sleep just in case to let other tasks run explicitly
-                await asyncio.sleep(0.01)
+    for s1, s2 in DIAMOND_WHITELIST:
+        if s1 not in price_data or s2 not in price_data: continue
+        result = await asyncio.to_thread(test_pair, price_data[s1], price_data[s2], s1, s2)
+        if result:
+            winners.append(result)
+        pairs_tested += 1
 
     winners.sort(key=lambda x: x["abs_z"], reverse=True)
-    logger.info(f"📡 Scanner: Math complete! Found {len(winners)} cointegrated pairs out of {pairs_tested} tested.")
+    logger.info(f"📡 Scanner: Diamond Scan complete! Found {len(winners)} active opportunities.")
     return winners
 
 # ═══════════════════════════════════════════════════════════════
@@ -784,7 +769,16 @@ class Orchestrator:
             winners = await scan_all_pairs()
             self.last_scan_winners = winners
             hot_pairs = [w for w in winners if w["abs_z"] >= 2.0]
-            new_hot_pairs = [w for w in hot_pairs if w["pair_key"] not in self.active_monitors]
+            new_hot_pairs = []
+            for w in hot_pairs:
+                if w["pair_key"] in self.active_monitors: continue
+                # 🛡️ ANTI-TOXIC FILTER: Block if 2+ SLs in history
+                display = w["display"]
+                stats = self.pair_stats.get(display, {})
+                if stats.get("sl_count", 0) >= 2:
+                    logger.warning(f"⏩ [Scanner] Blocking TOXIC pair {display} (SL Count: {stats['sl_count']})")
+                    continue
+                new_hot_pairs.append(w)
             
             now = datetime.now()
             # ONLY alert if we found NEW hot pairs OR if 1 hour has passed since the last alert
