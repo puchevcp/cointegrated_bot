@@ -223,6 +223,11 @@ class PairMonitor:
         self.launched_at = datetime.now()  # Track when monitor was launched
         self.SEARCH_TIMEOUT_MINUTES = 30   # Auto-close if no entry after 30 min
 
+        # Z-score reversion tracking
+        from collections import deque
+        self.z_history = deque(maxlen=120)  # Last 120 ticks of |Z|
+        self.z_peak = 0.0  # Maximum |Z| seen since launch
+
         self.state_file = os.path.join(DATA_DIR, f"state_{self.pair_key}.json")
         self.position = {
             "side": None, "tranches_filled": 0, "exits_done": 0,
@@ -280,7 +285,7 @@ class PairMonitor:
         self.pnl_snapshot += net_pnl
         if self.orchestrator:
             is_sl = "STOP_LOSS" in reason
-            self.orchestrator.add_pnl(net_pnl, is_sl=is_sl)
+            self.orchestrator.add_pnl(net_pnl, is_sl=is_sl, pair_display=self.display)
             # Log to daily history
             self.orchestrator.add_to_history({
                 "pair": self.display,
@@ -416,11 +421,16 @@ class PairMonitor:
         net = round(pnl - fees - funding, 2)
 
         pair_balance = CAPITAL_PER_PAIR + self.pnl_snapshot + net
-        msg = (f"🔴 <b>{reason}</b> | {self.display}\n"
+        is_sl = "STOP_LOSS" in reason
+        sl_emoji = "🔴🛑" if is_sl else "🔴"
+        msg = (f"{sl_emoji} <b>{reason}</b> | {self.display}\n"
                f"Closing remaining {remaining_pct*100:.0f}%\n"
                f"Gross: ${pnl:.2f} | Fees: ${fees:.2f} | Funding: ${funding:.2f}\n"
                f"<b>NET PnL: ${net:.2f}</b>\n"
                f"💼 Pair Balance: ${pair_balance:.2f}")
+        if is_sl and self.orchestrator:
+            new_sl_total = self.orchestrator.accumulated_sl + abs(net)
+            msg += f"\n\n❌ <b>SL Acumulado Total: -${new_sl_total:.2f}</b>"
         msg += self._get_summary_footer()
         logger.info(f"🔴 [{self.display}] {reason} | NET: ${net:.2f}")
         await send_telegram(msg)
@@ -504,6 +514,11 @@ class PairMonitor:
         abs_z = abs(z_score)
         expected_side = "SHORT_1_LONG_2" if z_score > 0 else "LONG_1_SHORT_2"
 
+        # Track Z-score for reversion filter
+        self.z_history.append(abs_z)
+        if abs_z > self.z_peak:
+            self.z_peak = abs_z
+
         # Funding rate check
         self._check_funding_rate()
 
@@ -567,6 +582,16 @@ class PairMonitor:
             next_idx = self.position["tranches_filled"]
             target_z = ENTRY_TRANCHES[next_idx][0]
             if abs_z >= target_z:
+                # Z-SCORE REVERSION FILTER: Only enter if Z has peaked and is coming back
+                # For first tranche: Z must have peaked above entry level and dropped at least 0.15
+                # For second tranche: no reversion needed (we already committed)
+                if next_idx == 0 and len(self.z_history) >= 30:
+                    if self.z_peak < target_z + 0.1 or (self.z_peak - abs_z) < 0.15:
+                        # Z is still rising or hasn't reverted enough — skip
+                        if self.ticks % 200 == 0:
+                            logger.info(f"⏸️ [{self.display}] Waiting for reversion: |Z|={abs_z:.2f}, Peak={self.z_peak:.2f}, Need drop of 0.15")
+                        return
+
                 capital = CAPITAL_PER_PAIR * ENTRY_TRANCHES[next_idx][1]
                 q1 = (capital / 2.0) / self.prices[self.sym1]
                 deviation = abs(spread - self.spread_mean)
@@ -574,6 +599,7 @@ class PairMonitor:
                 est_fees = (capital * 2) * FEE_RATE
                 if expected_pnl > (est_fees * 1.5):
                     if self.position["tranches_filled"] == 0 or self.position["side"] == expected_side:
+                        logger.info(f"✅ [{self.display}] Reversion confirmed: |Z|={abs_z:.2f}, Peak was {self.z_peak:.2f}")
                         await self._execute_entry(z_score, expected_side, next_idx)
 
         # Periodic log
@@ -656,6 +682,7 @@ class Orchestrator:
         self.accumulated_pnl = 0.0
         self.accumulated_tp = 0.0
         self.accumulated_sl = 0.0
+        self.pair_stats = {}  # {pair_display: {"tp_count": 0, "sl_count": 0, "tp_total": 0, "sl_total": 0}}
         self.global_state_file = os.path.join(DATA_DIR, "global_state.json")
         self._load_global_state()
         self.last_scan_winners = []
@@ -689,7 +716,10 @@ class Orchestrator:
                     self.accumulated_pnl = data.get("accumulated_pnl", 0.0)
                     self.accumulated_tp = data.get("accumulated_tp", 0.0)
                     self.accumulated_sl = data.get("accumulated_sl", 0.0)
+                    self.pair_stats = data.get("pair_stats", {})
                     logger.info(f"💰 Loaded global state: PnL=${self.accumulated_pnl:.2f} | TP=${self.accumulated_tp:.2f} | SL=${self.accumulated_sl:.2f}")
+                    if self.pair_stats:
+                        logger.info(f"📊 Loaded stats for {len(self.pair_stats)} pairs")
             except Exception as e:
                 logger.error(f"Error loading global state: {e}")
 
@@ -700,18 +730,31 @@ class Orchestrator:
                 json.dump({
                     "accumulated_pnl": self.accumulated_pnl,
                     "accumulated_tp": self.accumulated_tp,
-                    "accumulated_sl": self.accumulated_sl
+                    "accumulated_sl": self.accumulated_sl,
+                    "pair_stats": self.pair_stats
                 }, f, indent=2)
         except Exception as e:
             logger.error(f"Error saving global state: {e}")
 
-    def add_pnl(self, net_pnl, is_sl=False):
+    def add_pnl(self, net_pnl, is_sl=False, pair_display=""):
         """Add realized PnL to global tracking."""
         self.accumulated_pnl += net_pnl
         if is_sl:
             self.accumulated_sl += abs(net_pnl)
         else:
             self.accumulated_tp += net_pnl
+
+        # Update per-pair stats
+        if pair_display:
+            if pair_display not in self.pair_stats:
+                self.pair_stats[pair_display] = {"tp_count": 0, "sl_count": 0, "tp_total": 0.0, "sl_total": 0.0}
+            if is_sl:
+                self.pair_stats[pair_display]["sl_count"] += 1
+                self.pair_stats[pair_display]["sl_total"] += abs(net_pnl)
+            else:
+                self.pair_stats[pair_display]["tp_count"] += 1
+                self.pair_stats[pair_display]["tp_total"] += net_pnl
+
         self._save_global_state()
         logger.info(f"💰 Global PnL updated: ${self.accumulated_pnl:.2f} (added ${net_pnl:.2f}) | TP=${self.accumulated_tp:.2f} | SL=${self.accumulated_sl:.2f}")
 
@@ -975,6 +1018,17 @@ class Orchestrator:
         lines.append(f"❌ SL Acumulado: -${self.accumulated_sl:.2f}")
         lines.append(f"📈 Active Pairs: {active_pairs}/{MAX_PAIRS}")
         lines.append(f"💤 Idle Slots: {idle_capital_count}")
+
+        # Per-pair performance ranking
+        if self.pair_stats:
+            # Sort by most SL losses
+            worst = sorted(self.pair_stats.items(), key=lambda x: x[1]["sl_total"], reverse=True)
+            best = sorted(self.pair_stats.items(), key=lambda x: x[1]["tp_total"], reverse=True)
+            lines.append(f"\n📊 <b>Performance por Par:</b>")
+            for pair, stats in worst[:3]:
+                if stats["sl_count"] > 0 or stats["tp_count"] > 0:
+                    net = stats["tp_total"] - stats["sl_total"]
+                    lines.append(f"  {'🟢' if net >= 0 else '🔴'} {pair}: {stats['tp_count']}TP/${stats['sl_count']}SL | Net: ${net:+.2f}")
 
         # Add Scanner info
         if self.last_scan_winners:
